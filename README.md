@@ -27,6 +27,18 @@ vecrank query corpus.txt --q ... --metric euclidean --format json
 # the k-th ranked entry only (order statistic; k=1 best, k=count worst)
 vecrank nth corpus.txt --q ... --metric cosine --k 12
 
+# answer every query in a file ("label f1,f2,..." per line), grouped output
+vecrank batch corpus.txt --file queries.txt --metric cosine --k 3 --format csv
+
+# per-dimension statistics + L2-norm histogram
+vecrank stat corpus.txt --bins 10 --format json
+
+# symmetric int8 scalar quantization: per-dim scale/offset, reconstruction error
+vecrank quantize corpus.txt --error
+
+# rank the QUANTIZED corpus (dequantized scoring) — the int8 approximation path
+vecrank qrank corpus.txt --q ... --metric cosine --k 3
+
 # corpus metadata
 vecrank info corpus.txt
 ```
@@ -37,6 +49,10 @@ vecrank info corpus.txt
   `euclidean` (printed as negated distance, so every metric is
   "higher = more similar").
 - Ranking is total and deterministic: score descending, then id ascending.
+- Quantization is symmetric int8 per dimension: `q = round((x - offset) /
+  scale)` clamped to [-127, 127], with `scale = (max-min)/254` and
+  `offset = (max+min)/2` computed per dimension; a constant dimension uses the
+  degenerate scale 1. The same corpus always quantizes to the same codes.
 - The corpus file format is line-oriented text (`dims`/`count`/`seed` headers
   plus one `vec <id> <components...>` line per vector), diffable and
   inspectable; `add` rewrites it in canonical form.

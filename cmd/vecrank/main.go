@@ -37,6 +37,26 @@ Usage:
       Print exactly the K-th ranked entry (1-based). This is the order
       statistic: k=1 is the best match, k=count is the worst.
 
+  vecrank batch <corpus> --file <queries.txt> --metric cosine|dot|euclidean
+                    [--k K] [--format table|csv|json]
+      Answer every query in the file (one "label f1,f2,..." per line; #
+      comments). Output is grouped by query in file order, each group preceded
+      by "query <label>" in table/csv mode or nested under the label in json
+      mode. --k applies per query.
+
+  vecrank stat <corpus> [--bins B] [--format table|csv|json]
+      Per-dimension summary statistics (min/max/mean/std) plus an L2-norm
+      histogram over B equal-width bins (default 10).
+
+  vecrank quantize <corpus> [--format table|csv|json] [--error]
+      Report the symmetric int8 scalar quantization of the corpus: per-dim
+      scale and offset, and (with --error) the max and mean absolute
+      reconstruction error over all components.
+
+  vecrank qrank <corpus> --q f1,f2,... --metric cosine|dot|euclidean [--k K]
+      Rank the QUANTIZED corpus (dequantized scoring) — the deterministic
+      int8 approximation path. Same ordering conventions as query.
+
   vecrank info <corpus>
       Print dims, count, and seed of the corpus.
 
@@ -60,6 +80,14 @@ func main() {
 		err = cmdQuery(os.Args[2:])
 	case "nth":
 		err = cmdNth(os.Args[2:])
+	case "batch":
+		err = cmdBatch(os.Args[2:])
+	case "stat":
+		err = cmdStat(os.Args[2:])
+	case "quantize":
+		err = cmdQuantize(os.Args[2:])
+	case "qrank":
+		err = cmdQRank(os.Args[2:])
 	case "info":
 		err = cmdInfo(os.Args[2:])
 	case "help", "--help", "-h":
@@ -285,5 +313,236 @@ func cmdInfo(args []string) error {
 		return err
 	}
 	fmt.Printf("dims=%d count=%d seed=%d\n", c.Dims, len(c.Vecs), c.Seed)
+	return nil
+}
+
+// queryLine is one parsed line of a batch query file.
+type queryLine struct {
+	Label string
+	Q     []float64
+}
+
+func readQueryFile(path string, dims int) ([]queryLine, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var out []queryLine
+	for ln, line := range strings.Split(string(data), "\n") {
+		t := strings.TrimSpace(line)
+		if t == "" || strings.HasPrefix(t, "#") {
+			continue
+		}
+		label := t
+		rest := ""
+		if i := strings.IndexAny(t, " \t"); i >= 0 {
+			label, rest = t[:i], strings.TrimSpace(t[i+1:])
+		}
+		q, err := parseQuery(rest, dims)
+		if err != nil {
+			return nil, fmt.Errorf("%s line %d: %v", path, ln+1, err)
+		}
+		out = append(out, queryLine{Label: label, Q: q})
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("%s contains no queries", path)
+	}
+	return out, nil
+}
+
+func cmdBatch(args []string) error {
+	pos := positional(args)
+	if len(pos) != 1 {
+		return fmt.Errorf("batch takes exactly one corpus path")
+	}
+	c, err := store.Open(pos[0])
+	if err != nil {
+		return err
+	}
+	file := flagval(args, "file", "")
+	if file == "" {
+		return fmt.Errorf("batch requires --file")
+	}
+	ql, err := readQueryFile(file, c.Dims)
+	if err != nil {
+		return err
+	}
+	m := store.Metric(flagval(args, "metric", "cosine"))
+	if !store.ValidMetric(m) {
+		return fmt.Errorf("unknown metric %q (cosine|dot|euclidean)", m)
+	}
+	k := 0
+	if ks := flagval(args, "k", "0"); ks != "0" {
+		if k, err = strconv.Atoi(ks); err != nil || k <= 0 {
+			return fmt.Errorf("--k must be a positive integer")
+		}
+	}
+	format := flagval(args, "format", "table")
+	for _, one := range ql {
+		hits := c.Rank(m, one.Q)
+		if k > 0 {
+			if k > len(hits) {
+				return fmt.Errorf("query %q: --k %d exceeds corpus size %d", one.Label, k, len(hits))
+			}
+			hits = hits[:k]
+		}
+		switch format {
+		case "json":
+			var b strings.Builder
+			fmt.Fprintf(&b, "{\"query\":%q,\"hits\":[", one.Label)
+			for i, h := range hits {
+				if i > 0 {
+					b.WriteString(",")
+				}
+				fmt.Fprintf(&b, `{"rank":%d,"id":%q,"score":%s}`,
+					h.Rank, h.ID, store.FormatF(h.Score))
+			}
+			b.WriteString("]}\n")
+			fmt.Print(b.String())
+		default:
+			fmt.Printf("query %s\n", one.Label)
+			printHits(format, hits)
+		}
+	}
+	return nil
+}
+
+func cmdStat(args []string) error {
+	pos := positional(args)
+	if len(pos) != 1 {
+		return fmt.Errorf("stat takes exactly one corpus path")
+	}
+	c, err := store.Open(pos[0])
+	if err != nil {
+		return err
+	}
+	bins, err := strconv.Atoi(flagval(args, "bins", "10"))
+	if err != nil || bins <= 0 {
+		return fmt.Errorf("--bins must be a positive integer")
+	}
+	stats := c.Stats()
+	edges, counts := c.NormHistogram(bins)
+	switch format := flagval(args, "format", "table"); format {
+	case "csv":
+		fmt.Println("dim,min,max,mean,std")
+		for _, s := range stats {
+			fmt.Printf("%d,%s,%s,%s,%s\n", s.Dim,
+				store.FormatF(s.Min), store.FormatF(s.Max),
+				store.FormatF(s.Mean), store.FormatF(s.Std))
+		}
+		fmt.Println("bin,edge_lo,edge_hi,count")
+		for b := range counts {
+			fmt.Printf("%d,%s,%s,%d\n", b, store.FormatF(edges[b]),
+				store.FormatF(edges[b+1]), counts[b])
+		}
+	case "json":
+		var b strings.Builder
+		b.WriteString("{\"dims\":[")
+		for i, s := range stats {
+			if i > 0 {
+				b.WriteString(",")
+			}
+			fmt.Fprintf(&b, `{"dim":%d,"min":%s,"max":%s,"mean":%s,"std":%s}`,
+				s.Dim, store.FormatF(s.Min), store.FormatF(s.Max),
+				store.FormatF(s.Mean), store.FormatF(s.Std))
+		}
+		b.WriteString("],\"norm_histogram\":{\"bins\":[")
+		for i := range counts {
+			if i > 0 {
+				b.WriteString(",")
+			}
+			fmt.Fprintf(&b, `{"bin":%d,"edge_lo":%s,"edge_hi":%s,"count":%d}`,
+				i, store.FormatF(edges[i]), store.FormatF(edges[i+1]), counts[i])
+		}
+		b.WriteString("]}}\n")
+		fmt.Print(b.String())
+	default:
+		fmt.Println("dim\tmin\tmax\tmean\tstd")
+		for _, s := range stats {
+			fmt.Printf("%d\t%s\t%s\t%s\t%s\n", s.Dim,
+				store.FormatF(s.Min), store.FormatF(s.Max),
+				store.FormatF(s.Mean), store.FormatF(s.Std))
+		}
+		fmt.Println("bin\tedge_lo\tedge_hi\tcount")
+		for b := range counts {
+			fmt.Printf("%d\t%s\t%s\t%d\n", b, store.FormatF(edges[b]),
+				store.FormatF(edges[b+1]), counts[b])
+		}
+	}
+	return nil
+}
+
+func cmdQuantize(args []string) error {
+	pos := positional(args)
+	if len(pos) != 1 {
+		return fmt.Errorf("quantize takes exactly one corpus path")
+	}
+	c, err := store.Open(pos[0])
+	if err != nil {
+		return err
+	}
+	q := c.Quantize()
+	withErr := flagval(args, "error", "false") == "true"
+	stats := c.Stats()
+	switch format := flagval(args, "format", "table"); format {
+	case "csv":
+		fmt.Println("dim,scale,offset")
+		for d := range q.Scales {
+			fmt.Printf("%d,%s,%s\n", d, store.FormatF(q.Scales[d]), store.FormatF(q.Offsets[d]))
+		}
+	case "json":
+		var b strings.Builder
+		b.WriteString("{\"dims\":[")
+		for d := range q.Scales {
+			if d > 0 {
+				b.WriteString(",")
+			}
+			fmt.Fprintf(&b, `{"dim":%d,"scale":%s,"offset":%s,"min":%s,"max":%s}`,
+				d, store.FormatF(q.Scales[d]), store.FormatF(q.Offsets[d]),
+				store.FormatF(stats[d].Min), store.FormatF(stats[d].Max))
+		}
+		b.WriteString("]}\n")
+		fmt.Print(b.String())
+	default:
+		fmt.Println("dim\tscale\toffset")
+		for d := range q.Scales {
+			fmt.Printf("%d\t%s\t%s\n", d, store.FormatF(q.Scales[d]), store.FormatF(q.Offsets[d]))
+		}
+	}
+	if withErr {
+		maxAbs, meanAbs := c.ReconstructionError(q)
+		fmt.Printf("reconstruction_error\tmax=%s\tmean=%s\n",
+			store.FormatF(maxAbs), store.FormatF(meanAbs))
+	}
+	return nil
+}
+
+func cmdQRank(args []string) error {
+	pos := positional(args)
+	if len(pos) != 1 {
+		return fmt.Errorf("qrank takes exactly one corpus path")
+	}
+	c, err := store.Open(pos[0])
+	if err != nil {
+		return err
+	}
+	q, err := parseQuery(flagval(args, "q", ""), c.Dims)
+	if err != nil {
+		return err
+	}
+	m := store.Metric(flagval(args, "metric", "cosine"))
+	if !store.ValidMetric(m) {
+		return fmt.Errorf("unknown metric %q (cosine|dot|euclidean)", m)
+	}
+	qz := c.Quantize()
+	hits := qz.QRank(m, q)
+	if k := flagval(args, "k", "0"); k != "0" {
+		n, err := strconv.Atoi(k)
+		if err != nil || n <= 0 || n > len(hits) {
+			return fmt.Errorf("--k must be between 1 and %d", len(hits))
+		}
+		hits = hits[:n]
+	}
+	printHits(flagval(args, "format", "table"), hits)
 	return nil
 }

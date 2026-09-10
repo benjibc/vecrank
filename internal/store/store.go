@@ -270,3 +270,179 @@ func (c *Corpus) Rank(m Metric, q []float64) []Hit {
 	}
 	return hits
 }
+
+// DimStat is one dimension's summary statistics.
+type DimStat struct {
+	Dim  int
+	Min  float64
+	Max  float64
+	Mean float64
+	Std  float64 // population standard deviation
+}
+
+// Stats summarizes every dimension. With zero vectors, every field is 0.
+func (c *Corpus) Stats() []DimStat {
+	out := make([]DimStat, c.Dims)
+	n := float64(len(c.Vecs))
+	for d := 0; d < c.Dims; d++ {
+		var mn, mx, sum, sumsq float64
+		first := true
+		for _, v := range c.Vecs {
+			x := v.Comps[d]
+			if first || x < mn {
+				mn = x
+			}
+			if first || x > mx {
+				mx = x
+			}
+			first = false
+			sum += x
+			sumsq += x * x
+		}
+		if len(c.Vecs) == 0 {
+			continue
+		}
+		mean := sum / n
+		variance := sumsq/n - mean*mean
+		if variance < 0 {
+			variance = 0
+		}
+		out[d] = DimStat{Dim: d, Min: mn, Max: mx, Mean: mean, Std: math.Sqrt(variance)}
+	}
+	return out
+}
+
+// NormHistogram buckets L2 norms into the given number of equal-width bins
+// spanning [0, maxNorm]. Counts are a pure function of the corpus.
+func (c *Corpus) NormHistogram(bins int) (edges []float64, counts []int) {
+	if bins <= 0 {
+		panic("vecrank: bins must be positive")
+	}
+	var maxNorm float64
+	norms := make([]float64, len(c.Vecs))
+	for i, v := range c.Vecs {
+		var s float64
+		for _, x := range v.Comps {
+			s += x * x
+		}
+		norms[i] = math.Sqrt(s)
+		if norms[i] > maxNorm {
+			maxNorm = norms[i]
+		}
+	}
+	edges = make([]float64, bins+1)
+	counts = make([]int, bins)
+	for b := 0; b <= bins; b++ {
+		edges[b] = float64(b) * maxNorm / float64(bins)
+	}
+	for _, nrm := range norms {
+		b := int(nrm / (maxNorm / float64(bins)))
+		if b >= bins {
+			b = bins - 1
+		}
+		counts[b]++
+	}
+	return edges, counts
+}
+
+// Quantized is a scalar-quantized copy of a corpus: each component is mapped
+// with the symmetric int8 scheme q = round((x - offset) / scale) clamped to
+// [-127, 127], and Dequant reconstructs x' = offset + q*scale. Quantization
+// parameters are a pure function of the corpus (per-dimension min/max), so
+// the same corpus always quantizes to the same bytes.
+type Quantized struct {
+	Dims    int
+	Scales  []float64
+	Offsets []float64
+	Codes   [][]int8
+	Order   []string // ids in corpus order
+}
+
+// Quantize builds the int8 representation. scale is (max-min)/254 per dim
+// (never zero: a constant dimension uses scale 1 to avoid division by zero).
+func (c *Corpus) Quantize() *Quantized {
+	q := &Quantized{Dims: c.Dims,
+		Scales:  make([]float64, c.Dims),
+		Offsets: make([]float64, c.Dims),
+		Order:   make([]string, len(c.Vecs)),
+		Codes:   make([][]int8, len(c.Vecs)),
+	}
+	stats := c.Stats()
+	for d, s := range stats {
+		span := s.Max - s.Min
+		if span == 0 {
+			span = 254 // constant dim: degenerate scale, codes all equal
+		}
+		q.Scales[d] = span / 254
+		q.Offsets[d] = s.Min + (s.Max-s.Min)/2
+	}
+	for i, v := range c.Vecs {
+		q.Order[i] = v.ID
+		codes := make([]int8, c.Dims)
+		for d, x := range v.Comps {
+			f := math.Round((x - q.Offsets[d]) / q.Scales[d])
+			if f > 127 {
+				f = 127
+			}
+			if f < -127 {
+				f = -127
+			}
+			codes[d] = int8(f)
+		}
+		q.Codes[i] = codes
+	}
+	return q
+}
+
+// Dequant reconstructs float components from a code row.
+func (q *Quantized) Dequant(row int) []float64 {
+	out := make([]float64, q.Dims)
+	for d, code := range q.Codes[row] {
+		out[d] = q.Offsets[d] + float64(code)*q.Scales[d]
+	}
+	return out
+}
+
+// ReconstructionError reports the max and mean absolute component error of
+// dequantization across the whole corpus.
+func (c *Corpus) ReconstructionError(q *Quantized) (maxAbs, meanAbs float64) {
+	var sum float64
+	for i, v := range c.Vecs {
+		rec := q.Dequant(i)
+		for d := range v.Comps {
+			e := math.Abs(v.Comps[d] - rec[d])
+			if e > maxAbs {
+				maxAbs = e
+			}
+			sum += e
+		}
+	}
+	if len(c.Vecs) > 0 && c.Dims > 0 {
+		meanAbs = sum / float64(len(c.Vecs)*c.Dims)
+	}
+	return maxAbs, meanAbs
+}
+
+// QScore computes the metric between a quantized row and a float query using
+// dequantized components — deterministic and consistent with Score.
+func (q *Quantized) QScore(m Metric, row int, query []float64) float64 {
+	return Score(m, q.Dequant(row), query)
+}
+
+// QRank ranks all quantized rows by the metric (same total order as Rank).
+func (q *Quantized) QRank(m Metric, query []float64) []Hit {
+	hits := make([]Hit, 0, len(q.Order))
+	for i, id := range q.Order {
+		hits = append(hits, Hit{ID: id, Score: q.QScore(m, i, query)})
+	}
+	sort.SliceStable(hits, func(i, j int) bool {
+		if hits[i].Score != hits[j].Score {
+			return hits[i].Score > hits[j].Score
+		}
+		return hits[i].ID < hits[j].ID
+	})
+	for i := range hits {
+		hits[i].Rank = i + 1
+	}
+	return hits
+}

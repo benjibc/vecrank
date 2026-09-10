@@ -77,3 +77,52 @@ func TestEuclideanNegated(t *testing.T) {
 		t.Fatalf("euclidean should be negated distance, got %v", got)
 	}
 }
+
+func TestStatsDeterministic(t *testing.T) {
+	c := Generate(9, 100, 5)
+	s1 := c.Stats()
+	s2 := Generate(9, 100, 5).Stats()
+	for i := range s1 {
+		if s1[i] != s2[i] {
+			t.Fatalf("stats mismatch dim %d: %+v vs %+v", i, s1[i], s2[i])
+		}
+	}
+}
+
+func TestQuantizeRoundTrip(t *testing.T) {
+	c := Generate(11, 64, 6)
+	q := c.Quantize()
+	if len(q.Codes) != 64 || len(q.Codes[0]) != 6 {
+		t.Fatalf("bad quantized shape")
+	}
+	maxAbs, meanAbs := c.ReconstructionError(q)
+	// per-dim span/254 scale bounds the max error by span/2 in the worst case;
+	// for [-1,1] data the span is <= 2, so max error must stay under 1.
+	if maxAbs >= 1.0 || meanAbs >= maxAbs {
+		t.Fatalf("reconstruction error out of family: max=%v mean=%v", maxAbs, meanAbs)
+	}
+	// quantization is deterministic
+	q2 := Generate(11, 64, 6).Quantize()
+	for i := range q.Codes {
+		for d := range q.Codes[i] {
+			if q.Codes[i][d] != q2.Codes[i][d] {
+				t.Fatalf("quantize not deterministic at %d,%d", i, d)
+			}
+		}
+	}
+}
+
+func TestNormHistogram(t *testing.T) {
+	c := Generate(3, 50, 4)
+	edges, counts := c.NormHistogram(7)
+	total := 0
+	for _, n := range counts {
+		total += n
+	}
+	if total != 50 {
+		t.Fatalf("histogram lost vectors: %d", total)
+	}
+	if len(edges) != 8 || edges[0] != 0 || edges[7] <= 0 {
+		t.Fatalf("bad edges: %v", edges)
+	}
+}
